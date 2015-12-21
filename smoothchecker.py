@@ -54,7 +54,7 @@ def get_manifest(base_url, dest_dir=tempfile.gettempdir(),
             manifest_url += '/Manifest'
 
         if base_url.lower().endswith('/manifest'):
-            base_url = base_url.replace('/Manifest', '')
+            base_url = base_url[:base_url.rfind('/Manifest')]
 
         manifest_path = os.path.join(dest_dir, manifest_file)
         f = open(manifest_path, "w")
