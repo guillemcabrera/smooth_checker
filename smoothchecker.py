@@ -175,12 +175,12 @@ def check_chunks(base_url, manifest, stream_index, quality_level, processes):
     results = []
     count = 0
     for i, c in enumerate(stream.findall("c")):
-        count += int(c.attrib['d'])
         results.append(
             downloading_pool.apply_async(
                 check_single_chunk,
                 args=[base_url, get_chunk_quality_string(stream, quality_level),
                       get_chunk_name_string(stream, c, count)]))
+        count += int(c.attrib['d'])
     downloading_pool.close()
     downloading_pool.join()
     return [r.get() for r in results if r.get()[1] != 200]
