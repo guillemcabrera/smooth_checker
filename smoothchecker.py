@@ -27,11 +27,12 @@ import tempfile
 import csv
 import shutil
 import glob
-from retrying import retry
+import time
+#from retrying import retry
 from optparse import OptionParser
 from multiprocessing import Pool, cpu_count
-import redis
-from rq import get_current_job
+#import redis
+#from rq import get_current_job
 
 __description = "Analyze Smooth Streaming stream chunks"
 __version = "0.1"
@@ -40,6 +41,7 @@ __author_info = "Javier Lopez and Guillem Cabrera"
 RETRIES = 2
 MS_BETWEEN_RETRIES = 2000
 
+opener = urllib2.build_opener()
 
 def get_manifest(base_url, dest_dir=tempfile.gettempdir(),
                  manifest_file='Manifest'):
@@ -196,11 +198,70 @@ def check_single_chunk(base_url, chunks_quality, chunk_name):
         return e.url, e.code
 
 
-@retry(stop_max_attempt_number=RETRIES, wait_fixed=MS_BETWEEN_RETRIES)
+#@retry(stop_max_attempt_number=RETRIES, wait_fixed=MS_BETWEEN_RETRIES)
 def _check_single_chunk(chunk_url):
     request = urllib2.Request(chunk_url)
     request.get_method = lambda: 'HEAD'
     return urllib2.urlopen(request)
+
+
+def benchmark_stream(base_url, manifest, csv_file):
+    results = []
+    _bitrate = 0
+    _quality = 0
+
+    # Get the highest video quality for benchmark
+    for i, s in enumerate(manifest.findall('.//StreamIndex')):
+        stream_type = s.attrib["Type"]
+        if stream_type != 'video':
+            continue
+        print "Benchmarking stream {0}".format(i)
+        for j, q in enumerate(s.findall("QualityLevel")):
+            bitrate = q.attrib["Bitrate"]
+            if _bitrate > bitrate:
+                _bitrate = bitrate
+                _quality = j
+
+        print "Benchmarking quality {0}".format(_quality)
+        results.extend(benchmark_chunks(base_url, manifest, i, _quality))
+
+    # Write the csv file
+    write_results(results, csv_file)
+
+
+def benchmark_chunks(base_url, manifest, stream_index, quality_level):
+    stream = manifest.findall('.//StreamIndex')[stream_index]
+    count = 0
+    results = []
+    for i, c in enumerate(stream.findall("c")):
+        results.append(_benchmark_single_chunk(
+            base_url,
+            get_chunk_quality_string(stream, quality_level),
+            get_chunk_name_string(stream, c, count)))
+        count += int(c.attrib['d'])
+    return results
+
+
+def write_results(results, csv_file):
+    with open(csv_file, 'wb') as csv_file:
+        fw = csv.writer(csv_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_ALL)
+        for result in results:
+            fw.writerow(result)
+
+
+def _benchmark_single_chunk(base_url, chunks_quality, chunk_name):
+    chunk_url = base_url + '/' + chunks_quality + '/' + chunk_name
+    print chunk_url
+    request = urllib2.Request(chunk_url)
+    start = time.time()
+    resp = opener.open(request)
+    # read one byte
+    resp.read(1)
+    ttfb = time.time() - start
+    # # read the rest
+    length = len(resp.read()) + 1
+    ttlb = time.time() - start
+    return start, ttfb, ttlb, length, resp.info().headers
 
 
 def results_join(output_file):
@@ -230,6 +291,10 @@ def options_parser():
     parser.add_option("-p", "--parallel-processes", metavar="<int>",
                       dest="processes", default=cpu_count() * 6,
                       help="parallel processes to be launched")
+    parser.add_option("-b", "--benchmark", metavar="<csv_file>",
+                      dest="csv_file",
+                      help="benchmark mode to generate csv output")
+
     return parser
 
 
@@ -260,4 +325,10 @@ if __name__ == "__main__":
         parser.exit(0)
 
     print_manifest_info(manifest, url)
+
+    if options.csv_file:
+        benchmark_stream(url, manifest, options.csv_file)
+        parser.exit(0)
+
+
     check_all_streams_and_qualities(url, manifest, int(options.processes))
