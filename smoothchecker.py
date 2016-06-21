@@ -28,11 +28,8 @@ import csv
 import shutil
 import glob
 import time
-#from retrying import retry
 from optparse import OptionParser
 from multiprocessing import Pool, cpu_count
-#import redis
-#from rq import get_current_job
 
 __description = "Analyze Smooth Streaming stream chunks"
 __version = "0.1"
@@ -42,6 +39,7 @@ RETRIES = 2
 MS_BETWEEN_RETRIES = 2000
 
 opener = urllib2.build_opener()
+
 
 def get_manifest(base_url, dest_dir=tempfile.gettempdir(),
                  manifest_file='Manifest'):
@@ -131,11 +129,13 @@ def check_medias_in_csv_file(csv_file, dest_dir):
         for row in csv_reader:
             manifest, url = get_manifest(row[0], dest_dir)
             print_manifest_info(manifest)
-            row.append(len(check_all_streams_and_qualities(url, manifest)) == 0)
+            row.append(
+                len(check_all_streams_and_qualities(url, manifest)) == 0)
 
             manifest, url = get_manifest(row[1], dest_dir)
             print_manifest_info(manifest)
-            row.append(len(check_all_streams_and_qualities(url, manifest)) == 0)
+            row.append(
+                len(check_all_streams_and_qualities(url, manifest)) == 0)
 
             with open(csv_file + '_out', 'ab') as f:
                 csv.writer(f).writerow(row)
@@ -180,7 +180,8 @@ def check_chunks(base_url, manifest, stream_index, quality_level, processes):
         results.append(
             downloading_pool.apply_async(
                 check_single_chunk,
-                args=[base_url, get_chunk_quality_string(stream, quality_level),
+                args=[base_url,
+                      get_chunk_quality_string(stream, quality_level),
                       get_chunk_name_string(stream, c, count)]))
         count += int(c.attrib['d'])
     downloading_pool.close()
@@ -198,7 +199,6 @@ def check_single_chunk(base_url, chunks_quality, chunk_name):
         return e.url, e.code
 
 
-#@retry(stop_max_attempt_number=RETRIES, wait_fixed=MS_BETWEEN_RETRIES)
 def _check_single_chunk(chunk_url):
     request = urllib2.Request(chunk_url)
     request.get_method = lambda: 'HEAD'
@@ -244,7 +244,8 @@ def benchmark_chunks(base_url, manifest, stream_index, quality_level):
 
 def write_results(results, csv_file):
     with open(csv_file, 'wb') as csv_file:
-        fw = csv.writer(csv_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_ALL)
+        fw = csv.writer(
+            csv_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_ALL)
         for result in results:
             fw.writerow(result)
 
@@ -329,6 +330,5 @@ if __name__ == "__main__":
     if options.csv_file:
         benchmark_stream(url, manifest, options.csv_file)
         parser.exit(0)
-
 
     check_all_streams_and_qualities(url, manifest, int(options.processes))
