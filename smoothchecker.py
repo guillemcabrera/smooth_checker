@@ -27,6 +27,7 @@ import tempfile
 import csv
 import shutil
 import glob
+from httplib import BadStatusLine
 from retrying import retry
 from optparse import OptionParser
 from multiprocessing import Pool, cpu_count
@@ -37,8 +38,8 @@ __description = "Analyze Smooth Streaming stream chunks"
 __version = "0.1"
 __author_info = "Javier Lopez and Guillem Cabrera"
 
-RETRIES = 2
-MS_BETWEEN_RETRIES = 2000
+RETRIES = 0
+MS_BETWEEN_RETRIES = 1000
 
 
 def get_manifest(base_url, dest_dir=tempfile.gettempdir(),
@@ -66,11 +67,10 @@ def get_manifest(base_url, dest_dir=tempfile.gettempdir(),
     manifest = etree.parse(manifest_path)
     if manifest.getroot().attrib['MajorVersion'] != "2":
         raise Exception('Only Smooth Streaming version 2 supported')
-
     try:
         base_url = manifest.find("Clip").attrib["Url"].lower()\
             .replace("/manifest", "")
-    except:
+    except Exception as e:
         pass
     return manifest, base_url
 
@@ -118,7 +118,7 @@ def get_chunk_quality_string(stream, quality_level):
 def get_chunk_name_string(stream, chunk, i):
     try:
         t = chunk.attrib["t"]
-    except:
+    except Exception:
         t = str(i)
     return stream.attrib["Url"].split('/')[1].replace("{start time}", t)
 
@@ -129,11 +129,13 @@ def check_medias_in_csv_file(csv_file, dest_dir):
         for row in csv_reader:
             manifest, url = get_manifest(row[0], dest_dir)
             print_manifest_info(manifest)
-            row.append(len(check_all_streams_and_qualities(url, manifest)) == 0)
+            row.append(
+                len(check_all_streams_and_qualities(url, manifest)) == 0)
 
             manifest, url = get_manifest(row[1], dest_dir)
             print_manifest_info(manifest)
-            row.append(len(check_all_streams_and_qualities(url, manifest)) == 0)
+            row.append(
+                len(check_all_streams_and_qualities(url, manifest)) == 0)
 
             with open(csv_file + '_out', 'ab') as f:
                 csv.writer(f).writerow(row)
@@ -178,7 +180,8 @@ def check_chunks(base_url, manifest, stream_index, quality_level, processes):
         results.append(
             downloading_pool.apply_async(
                 check_single_chunk,
-                args=[base_url, get_chunk_quality_string(stream, quality_level),
+                args=[base_url, get_chunk_quality_string(
+                    stream, quality_level),
                       get_chunk_name_string(stream, c, count)]))
         count += int(c.attrib['d'])
     downloading_pool.close()
@@ -192,11 +195,13 @@ def check_single_chunk(base_url, chunks_quality, chunk_name):
         response = _check_single_chunk(chunk_url)
         return chunk_url, response.getcode()
     except urllib2.HTTPError as e:
-        print "{0} returned {1}".format(e.url, e.code)
+        print "{} returned {}".format(e.url, e.code)
         return e.url, e.code
+    except BadStatusLine:
+        print "{} returned bad status".format(chunk_url)
+        return chunk_url, 0
 
 
-@retry(stop_max_attempt_number=RETRIES, wait_fixed=MS_BETWEEN_RETRIES)
 def _check_single_chunk(chunk_url):
     request = urllib2.Request(chunk_url)
     request.get_method = lambda: 'HEAD'
@@ -228,7 +233,7 @@ def options_parser():
                       dest="dest_dir", default=tempfile.gettempdir(),
                       help="destination directory")
     parser.add_option("-p", "--parallel-processes", metavar="<int>",
-                      dest="processes", default=cpu_count() * 6,
+                      dest="processes", default=cpu_count() * 2,
                       help="parallel processes to be launched")
     return parser
 
