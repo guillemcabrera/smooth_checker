@@ -19,7 +19,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import urllib2
 from csv import reader, writer
 from glob import glob
 from multiprocessing import Pool, cpu_count
@@ -27,6 +26,7 @@ from optparse import OptionParser
 from os import mkdir
 from os.path import exists, join
 from redis import Redis
+from requests import get, head
 from rq import get_current_job
 from shutil import copyfileobj
 from tempfile import gettempdir
@@ -55,10 +55,11 @@ def get_manifest(base_url, dest_dir=gettempdir(),
         if base_url.lower().endswith('/manifest'):
             base_url = base_url[:base_url.rfind('/Manifest')]
 
-        manifest_path = os.path.join(dest_dir, manifest_file)
-        f = open(manifest_path, "w")
-        f.write(urllib2.urlopen(manifest_url).read())
-        f.close()
+        manifest_path = join(dest_dir, manifest_file)
+        response = get(manifest_url)
+        if response.ok:
+            with open(manifest_path, "w") as f:
+                f.write(response.text)
     else:
         manifest_path = base_url
 
@@ -191,19 +192,14 @@ def check_single_chunk(base_url, chunks_quality, chunk_name):
     chunk_url = base_url + '/' + chunks_quality + '/' + chunk_name
     try:
         response = _check_single_chunk(chunk_url)
-        return chunk_url, response.getcode()
-    except urllib2.HTTPError as e:
-        print "{} returned {}".format(e.url, e.code)
-        return e.url, e.code
-    except BadStatusLine:
-        print "{} returned bad status".format(chunk_url)
+        return chunk_url, response.status_code
+    except Exception:
+        print "Something went wrong with {}".format(chunk_url)
         return chunk_url, 0
 
 
 def _check_single_chunk(chunk_url):
-    request = urllib2.Request(chunk_url)
-    request.get_method = lambda: 'HEAD'
-    return urllib2.urlopen(request)
+    return head(chunk_url)
 
 
 def results_join(output_file):
