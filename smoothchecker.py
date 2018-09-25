@@ -24,15 +24,10 @@ import os
 import xml.etree.ElementTree as etree
 import urllib2
 import tempfile
-import csv
 import shutil
 import glob
 from httplib import BadStatusLine
-from retrying import retry
 from optparse import OptionParser
-from multiprocessing import Pool, cpu_count
-import redis
-from rq import get_current_job
 
 __description = "Analyze Smooth Streaming stream chunks"
 __version = "0.1"
@@ -51,9 +46,6 @@ def get_manifest(base_url, dest_dir=tempfile.gettempdir(),
 
     if base_url.startswith('http://'):
         manifest_url = base_url
-        if not manifest_url.lower().endswith(('/manifest', '.ismc', '.csm')):
-            manifest_url += '/Manifest'
-
         if base_url.lower().endswith('/manifest'):
             base_url = base_url[:base_url.rfind('/Manifest')]
 
@@ -123,75 +115,33 @@ def get_chunk_name_string(stream, chunk, i):
     return stream.attrib["Url"].split('/')[1].replace("{start time}", t)
 
 
-def check_medias_in_csv_file(csv_file, dest_dir):
-    with open(csv_file, 'rb') as csvfile:
-        csv_reader = csv.reader(csvfile, delimiter=',')
-        for row in csv_reader:
-            manifest, url = get_manifest(row[0], dest_dir)
-            print_manifest_info(manifest)
-            row.append(
-                len(check_all_streams_and_qualities(url, manifest)) == 0)
-
-            manifest, url = get_manifest(row[1], dest_dir)
-            print_manifest_info(manifest)
-            row.append(
-                len(check_all_streams_and_qualities(url, manifest)) == 0)
-
-            with open(csv_file + '_out', 'ab') as f:
-                csv.writer(f).writerow(row)
-
-
-def check_media_job(data, output_file_name):
-    manifest, url = get_manifest(data['url'], tempfile.gettempdir())
-    print_manifest_info(manifest, url)
-    errors = check_all_streams_and_qualities(url, manifest, 1)
-    data['result'] = len(errors) < 1
-    if not data['result']:
-        data['errors'] = errors
-
-    output_file_name = "{0}{1}.csv"\
-        .format(output_file_name, get_current_job(connection=redis.Redis()).id)
-    with open(output_file_name, 'ab') as f:
-        csv.writer(f).writerow([data.get('url'),
-                                data.get('cdn'),
-                                data.get('media_key'),
-                                data.get('streamable_id'),
-                                data.get('result'),
-                                data.get('errors')])
-    return True
-
-
-def check_all_streams_and_qualities(base_url, manifest, processes):
+def check_all_streams_and_qualities(base_url, manifest):
     errors = []
     for i, s in enumerate(manifest.findall('.//StreamIndex')):
         print "Checking stream {0}".format(i)
         for j, q in enumerate(s.findall("QualityLevel")):
             print "Checking quality {0}".format(j)
-            errors.extend(check_chunks(base_url, manifest, i, j, processes))
+            errors.extend(check_chunks(base_url, manifest, i, j))
     return errors
 
 
-def check_chunks(base_url, manifest, stream_index, quality_level, processes):
+def check_chunks(base_url, manifest, stream_index, quality_level):
     stream = manifest.findall('.//StreamIndex')[stream_index]
-    downloading_pool = Pool(processes=processes)
     results = []
     count = 0
     for i, c in enumerate(stream.findall("c")):
-        results.append(
-            downloading_pool.apply_async(
-                check_single_chunk,
-                args=[base_url, get_chunk_quality_string(
+        results.append(check_single_chunk(
+                base_url, get_chunk_quality_string(
                     stream, quality_level),
-                      get_chunk_name_string(stream, c, count)]))
+                      get_chunk_name_string(stream, c, count)))
         count += int(c.attrib['d'])
-    downloading_pool.close()
-    downloading_pool.join()
-    return [r.get() for r in results if r.get()[1] != 200]
+    return [r for r in results if r[1] != 200]
 
 
 def check_single_chunk(base_url, chunks_quality, chunk_name):
     chunk_url = base_url + '/' + chunks_quality + '/' + chunk_name
     try:
+        print chunk_url
         response = _check_single_chunk(chunk_url)
         return chunk_url, response.getcode()
     except urllib2.HTTPError as e:
@@ -204,7 +154,6 @@ def check_single_chunk(base_url, chunks_quality, chunk_name):
 
 def _check_single_chunk(chunk_url):
     request = urllib2.Request(chunk_url)
-    request.get_method = lambda: 'HEAD'
     return urllib2.urlopen(request)
 
 
@@ -232,9 +181,6 @@ def options_parser():
     parser.add_option("-d", "--dest-dir", metavar="<dir>",
                       dest="dest_dir", default=tempfile.gettempdir(),
                       help="destination directory")
-    parser.add_option("-p", "--parallel-processes", metavar="<int>",
-                      dest="processes", default=cpu_count() * 2,
-                      help="parallel processes to be launched")
     return parser
 
 
@@ -253,9 +199,6 @@ if __name__ == "__main__":
     elif options.results:
         results_join(args[0])
         parser.exit(0)
-    else:
-        check_medias_in_csv_file(args[0], options.dest_dir)
-        parser.exit(0)
 
     if options.manifest_only:
         parser.exit(0)
@@ -265,4 +208,4 @@ if __name__ == "__main__":
         parser.exit(0)
 
     print_manifest_info(manifest, url)
-    check_all_streams_and_qualities(url, manifest, int(options.processes))
+    check_all_streams_and_qualities(url, manifest)
