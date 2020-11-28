@@ -21,7 +21,7 @@
 
 from csv import reader, writer
 from glob import glob
-from http.client import BadStatusLine
+from httpx import Client, codes, HTTPError
 from multiprocessing import Pool, cpu_count
 from optparse import OptionParser
 from os import mkdir
@@ -30,8 +30,6 @@ from redis import Redis
 from rq import get_current_job
 from shutil import copyfileobj
 from tempfile import gettempdir
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 from xml.etree.ElementTree import parse
 
 __description = 'Analyze Smooth Streaming stream chunks'
@@ -40,6 +38,7 @@ __author_info = 'Javier Lopez and Guillem Cabrera'
 
 RETRIES = 0
 MS_BETWEEN_RETRIES = 1000
+http_client = Client()
 
 
 def get_manifest(base_url, dest_dir=gettempdir(), manifest_file='Manifest'):
@@ -59,7 +58,14 @@ def get_manifest(base_url, dest_dir=gettempdir(), manifest_file='Manifest'):
 
         manifest_path = join(dest_dir, manifest_file)
         with open(manifest_path, 'wb') as f:
-            f.write(urlopen(manifest_url).read())
+            try:
+                response = http_client.get(manifest_url)
+                response.raise_for_status()
+                f.write(response.content)
+            except HTTPError as e:
+                print(f"Got {e.response.status_code} while requesting manifest"
+                      f" {e.request.url}")
+                exit(1)
     else:
         manifest_path = base_url
 
@@ -69,8 +75,8 @@ def get_manifest(base_url, dest_dir=gettempdir(), manifest_file='Manifest'):
     try:
         base_url = _manifest.find('Clip').attrib['Url'].lower()\
             .replace('/manifest', '')
-    except Exception as _:
-        pass
+    except Exception as e:
+        print(e)
 
     return _manifest, base_url
 
@@ -183,26 +189,16 @@ def check_chunks(base_url, _manifest, stream_index, quality_level, processes):
         count += int(c.attrib['d'])
     downloading_pool.close()
     downloading_pool.join()
-    return [r.get() for r in results if r.get()[1] != 200]
+    return [r.get() for r in results if r.get()[1] != codes.OK]
 
 
 def check_single_chunk(base_url, chunks_quality, chunk_name):
     chunk_url = base_url + '/' + chunks_quality + '/' + chunk_name
     try:
-        response = _check_single_chunk(chunk_url)
-        return chunk_url, response.getcode()
+        return chunk_url, http_client.head(chunk_url).status_code
     except HTTPError as e:
-        print(f"{e.url} returned {e.code}")
+        print(f"{e.request.url} returned {e.response.status_code}")
         return e.url, e.code
-    except BadStatusLine:
-        print(f"{chunk_url} returned bad status")
-        return chunk_url, 0
-
-
-def _check_single_chunk(chunk_url):
-    request = Request(chunk_url)
-    request.get_method = lambda: 'HEAD'
-    return urlopen(request)
 
 
 def results_join(output_file):
@@ -263,3 +259,4 @@ if __name__ == '__main__':
 
     print_manifest_info(manifest, url)
     check_all_streams_and_qualities(url, manifest, int(options.processes))
+    http_client.close()
