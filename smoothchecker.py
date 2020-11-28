@@ -24,13 +24,11 @@ from glob import glob
 from httpx import Client, codes, HTTPError
 from multiprocessing import Pool, cpu_count
 from optparse import OptionParser
-from os import mkdir
-from os.path import exists, join
 from redis import Redis
 from rq import get_current_job
 from shutil import copyfileobj
 from tempfile import gettempdir
-from xml.etree.ElementTree import parse
+from xml.etree.ElementTree import fromstring
 
 __description = 'Analyze Smooth Streaming stream chunks'
 __version = '0.1'
@@ -41,12 +39,10 @@ MS_BETWEEN_RETRIES = 1000
 http_client = Client()
 
 
-def get_manifest(base_url, dest_dir=gettempdir(), manifest_file='Manifest'):
+def get_manifest(base_url):
     """
     Returns the manifest and the new URL if this is changed
     """
-    if not exists(dest_dir):
-        mkdir(dest_dir, mode=0o755)
 
     if base_url.startswith('http://'):
         manifest_url = base_url
@@ -56,29 +52,17 @@ def get_manifest(base_url, dest_dir=gettempdir(), manifest_file='Manifest'):
         if base_url.lower().endswith('/manifest'):
             base_url = base_url[:base_url.rfind('/Manifest')]
 
-        manifest_path = join(dest_dir, manifest_file)
-        with open(manifest_path, 'wb') as f:
-            try:
-                response = http_client.get(manifest_url)
-                response.raise_for_status()
-                f.write(response.content)
-            except HTTPError as e:
-                print(f"Got {e.response.status_code} while requesting manifest"
-                      f" {e.request.url}")
-                exit(1)
-    else:
-        manifest_path = base_url
-
-    _manifest = parse(manifest_path)
-    if _manifest.getroot().attrib['MajorVersion'] != '2':
-        raise Exception('Only Smooth Streaming version 2 supported')
-    try:
-        base_url = _manifest.find('Clip').attrib['Url'].lower()\
-            .replace('/manifest', '')
-    except Exception as e:
-        print(e)
-
-    return _manifest, base_url
+        try:
+            response = http_client.get(manifest_url)
+            response.raise_for_status()
+            _manifest = fromstring(response.content)
+            if _manifest.attrib['MajorVersion'] != '2':
+                raise Exception('Only Smooth Streaming version 2 supported')
+            return _manifest, base_url
+        except HTTPError as e:
+            print(f"Got {e.response.status_code} while requesting manifest"
+                  f" {e.request.url}")
+            exit(1)
 
 
 def print_manifest_info(_manifest, _url):
@@ -127,15 +111,15 @@ def get_chunk_name_string(stream, chunk, i):
     return stream.attrib['Url'].split('/')[1].replace('{start time}', t)
 
 
-def check_medias_in_csv_file(csv_file, dest_dir):
+def check_medias_in_csv_file(csv_file):
     with open(csv_file, 'rb') as csvfile:
         for row in reader(csvfile, delimiter=','):
-            _manifest, _url = get_manifest(row[0], dest_dir)
+            _manifest, _url = get_manifest(row[0])
             print_manifest_info(_manifest)
             row.append(
                 len(check_all_streams_and_qualities(_url, _manifest)) == 0)
 
-            _manifest, _url = get_manifest(row[1], dest_dir)
+            _manifest, _url = get_manifest(row[1])
             print_manifest_info(_manifest)
             row.append(
                 len(check_all_streams_and_qualities(_url, _manifest)) == 0)
@@ -145,7 +129,7 @@ def check_medias_in_csv_file(csv_file, dest_dir):
 
 
 def check_media_job(data, output_file_name):
-    _manifest, _url = get_manifest(data['url'], gettempdir())
+    _manifest, _url = get_manifest(data['url'])
     print_manifest_info(_manifest, _url)
     errors = check_all_streams_and_qualities(_url, _manifest, 1)
     data['result'] = len(errors) < 1
@@ -198,7 +182,7 @@ def check_single_chunk(base_url, chunks_quality, chunk_name):
         return chunk_url, http_client.head(chunk_url).status_code
     except HTTPError as e:
         print(f"{e.request.url} returned {e.response.status_code}")
-        return e.url, e.code
+        return e.request.url, e.response.status_code
 
 
 def results_join(output_file):
@@ -242,12 +226,12 @@ if __name__ == '__main__':
 
     if args[0].startswith('http://'):
         url = args[0]
-        manifest, url = get_manifest(url, options.dest_dir)
+        manifest, url = get_manifest(url)
     elif options.results:
         results_join(args[0])
         parser.exit(0)
     else:
-        check_medias_in_csv_file(args[0], options.dest_dir)
+        check_medias_in_csv_file(args[0])
         parser.exit(0)
 
     if options.manifest_only:
