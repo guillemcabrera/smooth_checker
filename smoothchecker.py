@@ -19,35 +19,30 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
-import os
-import xml.etree.ElementTree as etree
-import urllib2
-import tempfile
-import csv
-import shutil
-import glob
-from httplib import BadStatusLine
-from retrying import retry
-from optparse import OptionParser
+from csv import reader, writer
+from glob import glob
+from httpx import Client, codes, HTTPError
 from multiprocessing import Pool, cpu_count
-import redis
+from optparse import OptionParser
+from redis import Redis
 from rq import get_current_job
+from shutil import copyfileobj
+from tempfile import gettempdir
+from xml.etree.ElementTree import fromstring
 
-__description = "Analyze Smooth Streaming stream chunks"
-__version = "0.1"
-__author_info = "Javier Lopez and Guillem Cabrera"
+__description = 'Analyze Smooth Streaming stream chunks'
+__version = '0.1'
+__author_info = 'Javier Lopez and Guillem Cabrera'
 
 RETRIES = 0
 MS_BETWEEN_RETRIES = 1000
+http_client = Client()
 
 
-def get_manifest(base_url, dest_dir=tempfile.gettempdir(),
-                 manifest_file='Manifest'):
-    """Returns the manifest and the new URL if this is changed"""
-
-    if not os.path.exists(dest_dir):
-        os.mkdir(dest_dir, 0755)
+def get_manifest(base_url):
+    """
+    Returns the manifest and the new URL if this is changed
+    """
 
     if base_url.startswith('http://'):
         manifest_url = base_url
@@ -57,52 +52,45 @@ def get_manifest(base_url, dest_dir=tempfile.gettempdir(),
         if base_url.lower().endswith('/manifest'):
             base_url = base_url[:base_url.rfind('/Manifest')]
 
-        manifest_path = os.path.join(dest_dir, manifest_file)
-        f = open(manifest_path, "w")
-        f.write(urllib2.urlopen(manifest_url).read())
-        f.close()
-    else:
-        manifest_path = base_url
-
-    manifest = etree.parse(manifest_path)
-    if manifest.getroot().attrib['MajorVersion'] != "2":
-        raise Exception('Only Smooth Streaming version 2 supported')
-    try:
-        base_url = manifest.find("Clip").attrib["Url"].lower()\
-            .replace("/manifest", "")
-    except Exception as e:
-        pass
-    return manifest, base_url
+        try:
+            response = http_client.get(manifest_url)
+            response.raise_for_status()
+            _manifest = fromstring(response.content)
+            if _manifest.attrib['MajorVersion'] != '2':
+                raise Exception('Only Smooth Streaming version 2 supported')
+            return _manifest, base_url
+        except HTTPError as e:
+            print(f"Got {e.response.status_code} while requesting manifest"
+                  f" {e.request.url}")
+            exit(1)
 
 
-def print_manifest_info(manifest, url):
-    print "Manifest URL %s" % (url)
-    for i, s in enumerate(manifest.findall('.//StreamIndex')):
-        stream_type = s.attrib["Type"]
-        print "Stream: %s Type: %s" % (i, stream_type)
-        print "\tQuality Levels:"
-        for j, q in enumerate(s.findall("QualityLevel")):
-            bitrate = q.attrib["Bitrate"]
-            fourcc = q.attrib["FourCC"]
+def print_manifest_info(_manifest, _url):
+    print(f"Manifest URL {_url}")
+    for i, s in enumerate(_manifest.findall('.//StreamIndex')):
+        stream_type = s.attrib['Type']
+        print(f"Stream: {i} Type: {stream_type}")
+        print('\tQuality Levels:')
+        for j, q in enumerate(s.findall('QualityLevel')):
+            bitrate = q.attrib['Bitrate']
+            fourcc = q.attrib['FourCC']
 
-            if stream_type == "video":
-                size = "%sx%s" % (q.attrib["MaxWidth"], q.attrib["MaxHeight"])
-                print "\t%2s: %4s %10s @ %7s bps" % (j, fourcc, size, bitrate)
-            if stream_type == "audio":
-                channels = q.attrib["Channels"]
-                sampling_rate = q.attrib["SamplingRate"]
-                bits_per_sample = q.attrib["BitsPerSample"]
-                print "\t%2s: %4s %sHz %sbits %sch @ %7s " \
-                      "bps" % (j, fourcc, sampling_rate, bits_per_sample,
-                               channels, bitrate)
-    print
+            if stream_type == 'video':
+                size = f"{q.attrib['MaxWidth']}x{q.attrib['MaxHeight']}"
+                print(f"\t{j:2}: {fourcc:4} {size:10} @ {bitrate:7} bps")
+            if stream_type == 'audio':
+                channels = q.attrib['Channels']
+                sampling_rate = q.attrib['SamplingRate']
+                bits_per_sample = q.attrib['BitsPerSample']
+                print(f"\t{j:2}: {fourcc:4} {sampling_rate}Hz "
+                      f"{bits_per_sample}bits {channels}ch @ {bitrate:7} bps")
+    print('')
 
 
 def get_chunk_quality_string(stream, quality_level):
-    quality = stream.findall("QualityLevel")[quality_level]
-    quality_attributes = quality.findall("CustomAttributes/Attribute")
-    custom_attributes = ''.join(["%s=%s," % (i.attrib["Name"],
-                                             i.attrib["Value"])
+    quality = stream.findall('QualityLevel')[quality_level]
+    quality_attributes = quality.findall('CustomAttributes/Attribute')
+    custom_attributes = ''.join([f"{i.attrib['Name']}={i.attrib['Value']},"
                                  for i in quality_attributes]).rstrip(',')
 
     # Assume URLs are in this form:
@@ -110,73 +98,72 @@ def get_chunk_quality_string(stream, quality_level):
     # or
     # Url="QualityLevels({bitrate},{CustomAttributes})/
     #     Fragments(video={start time})"
-    return stream.attrib["Url"].split('/')[0]\
-        .replace("{bitrate}", quality.attrib["Bitrate"])\
-        .replace("{CustomAttributes}", custom_attributes)
+    return stream.attrib['Url'].split('/')[0]\
+        .replace('{bitrate}', quality.attrib['Bitrate'])\
+        .replace('{CustomAttributes}', custom_attributes)
 
 
 def get_chunk_name_string(stream, chunk, i):
     try:
-        t = chunk.attrib["t"]
+        t = chunk.attrib['t']
     except Exception:
         t = str(i)
-    return stream.attrib["Url"].split('/')[1].replace("{start time}", t)
+    return stream.attrib['Url'].split('/')[1].replace('{start time}', t)
 
 
-def check_medias_in_csv_file(csv_file, dest_dir):
+def check_medias_in_csv_file(csv_file):
     with open(csv_file, 'rb') as csvfile:
-        csv_reader = csv.reader(csvfile, delimiter=',')
-        for row in csv_reader:
-            manifest, url = get_manifest(row[0], dest_dir)
-            print_manifest_info(manifest)
+        for row in reader(csvfile, delimiter=','):
+            _manifest, _url = get_manifest(row[0])
+            print_manifest_info(_manifest)
             row.append(
-                len(check_all_streams_and_qualities(url, manifest)) == 0)
+                len(check_all_streams_and_qualities(_url, _manifest)) == 0)
 
-            manifest, url = get_manifest(row[1], dest_dir)
-            print_manifest_info(manifest)
+            _manifest, _url = get_manifest(row[1])
+            print_manifest_info(_manifest)
             row.append(
-                len(check_all_streams_and_qualities(url, manifest)) == 0)
+                len(check_all_streams_and_qualities(_url, _manifest)) == 0)
 
             with open(csv_file + '_out', 'ab') as f:
-                csv.writer(f).writerow(row)
+                writer(f).writerow(row)
 
 
 def check_media_job(data, output_file_name):
-    manifest, url = get_manifest(data['url'], tempfile.gettempdir())
-    print_manifest_info(manifest, url)
-    errors = check_all_streams_and_qualities(url, manifest, 1)
+    _manifest, _url = get_manifest(data['url'])
+    print_manifest_info(_manifest, _url)
+    errors = check_all_streams_and_qualities(_url, _manifest, 1)
     data['result'] = len(errors) < 1
     if not data['result']:
         data['errors'] = errors
 
-    output_file_name = "{0}{1}.csv"\
-        .format(output_file_name, get_current_job(connection=redis.Redis()).id)
+    output_file_name = (f"{output_file_name}"
+                        f"{get_current_job(connection=Redis()).id}.csv")
     with open(output_file_name, 'ab') as f:
-        csv.writer(f).writerow([data.get('url'),
-                                data.get('cdn'),
-                                data.get('media_key'),
-                                data.get('streamable_id'),
-                                data.get('result'),
-                                data.get('errors')])
+        writer(f).writerow([data.get('url'),
+                            data.get('cdn'),
+                            data.get('media_key'),
+                            data.get('streamable_id'),
+                            data.get('result'),
+                            data.get('errors')])
     return True
 
 
-def check_all_streams_and_qualities(base_url, manifest, processes):
+def check_all_streams_and_qualities(base_url, _manifest, processes):
     errors = []
-    for i, s in enumerate(manifest.findall('.//StreamIndex')):
-        print "Checking stream {0}".format(i)
-        for j, q in enumerate(s.findall("QualityLevel")):
-            print "Checking quality {0}".format(j)
-            errors.extend(check_chunks(base_url, manifest, i, j, processes))
+    for i, s in enumerate(_manifest.findall('.//StreamIndex')):
+        print(f"Checking stream {i}")
+        for j, q in enumerate(s.findall('QualityLevel')):
+            print(f"Checking quality {j}")
+            errors.extend(check_chunks(base_url, _manifest, i, j, processes))
     return errors
 
 
-def check_chunks(base_url, manifest, stream_index, quality_level, processes):
-    stream = manifest.findall('.//StreamIndex')[stream_index]
+def check_chunks(base_url, _manifest, stream_index, quality_level, processes):
+    stream = _manifest.findall('.//StreamIndex')[stream_index]
     downloading_pool = Pool(processes=processes)
     results = []
     count = 0
-    for i, c in enumerate(stream.findall("c")):
+    for c in stream.findall('c'):
         results.append(
             downloading_pool.apply_async(
                 check_single_chunk,
@@ -186,60 +173,50 @@ def check_chunks(base_url, manifest, stream_index, quality_level, processes):
         count += int(c.attrib['d'])
     downloading_pool.close()
     downloading_pool.join()
-    return [r.get() for r in results if r.get()[1] != 200]
+    return [r.get() for r in results if r.get()[1] != codes.OK]
 
 
 def check_single_chunk(base_url, chunks_quality, chunk_name):
     chunk_url = base_url + '/' + chunks_quality + '/' + chunk_name
     try:
-        response = _check_single_chunk(chunk_url)
-        return chunk_url, response.getcode()
-    except urllib2.HTTPError as e:
-        print "{} returned {}".format(e.url, e.code)
-        return e.url, e.code
-    except BadStatusLine:
-        print "{} returned bad status".format(chunk_url)
-        return chunk_url, 0
-
-
-def _check_single_chunk(chunk_url):
-    request = urllib2.Request(chunk_url)
-    request.get_method = lambda: 'HEAD'
-    return urllib2.urlopen(request)
+        return chunk_url, http_client.head(chunk_url).status_code
+    except HTTPError as e:
+        print(f"{e.request.url} returned {e.response.status_code}")
+        return e.request.url, e.response.status_code
 
 
 def results_join(output_file):
     with open(output_file, 'wb') as outfile:
-        for result_file in glob.glob('results/*.csv'):
+        for result_file in glob('results/*.csv'):
             with open(result_file, 'rb') as readfile:
-                shutil.copyfileobj(readfile, outfile)
+                copyfileobj(readfile, outfile)
 
 
 def options_parser():
-    version = "%%prog %s" % __version
-    usage = "usage: %prog [options] <manifest URL or file>"
-    parser = OptionParser(usage=usage, version=version,
-                          description=__description, epilog=__author_info)
-    parser.add_option("-i", "--info",
-                      action="store_true", dest="info_only",
-                      default=False, help="print Manifest info and exit")
-    parser.add_option("-m", "--manifest-only",
-                      action="store_true", dest="manifest_only",
-                      default=False, help="download Manifest file and exit")
-    parser.add_option("-r", "--prepare-results",
-                      action="store_true", dest="results",
-                      default=False, help="")
-    parser.add_option("-d", "--dest-dir", metavar="<dir>",
-                      dest="dest_dir", default=tempfile.gettempdir(),
-                      help="destination directory")
-    parser.add_option("-p", "--parallel-processes", metavar="<int>",
-                      dest="processes", default=cpu_count() * 2,
-                      help="parallel processes to be launched")
-    return parser
+    _parser = OptionParser(
+        usage="usage: %prog [options] <manifest URL or file>",
+        version=("%%prog %s" % __version),
+        epilog=__author_info)
+    _parser.add_option('-i', '--info',
+                       action='store_true', dest='info_only',
+                       default=False, help='print Manifest info and exit')
+    _parser.add_option('-m', '--manifest-only',
+                       action='store_true', dest='manifest_only',
+                       default=False, help='download Manifest file and exit')
+    _parser.add_option('-r', '--prepare-results',
+                       action='store_true', dest='results',
+                       default=False, help='')
+    _parser.add_option('-d', '--dest-dir', metavar='<dir>',
+                       dest='dest_dir', default=gettempdir(),
+                       help='destination directory')
+    _parser.add_option('-p', '--parallel-processes', metavar='<int>',
+                       dest='processes', default=cpu_count() * 2,
+                       help='parallel processes to be launched')
+    return _parser
 
 
-if __name__ == "__main__":
-
+if __name__ == '__main__':
+    manifest, url = '', ''
     parser = options_parser()
     (options, args) = parser.parse_args()
 
@@ -249,12 +226,12 @@ if __name__ == "__main__":
 
     if args[0].startswith('http://'):
         url = args[0]
-        manifest, url = get_manifest(url, options.dest_dir)
+        manifest, url = get_manifest(url)
     elif options.results:
         results_join(args[0])
         parser.exit(0)
     else:
-        check_medias_in_csv_file(args[0], options.dest_dir)
+        check_medias_in_csv_file(args[0])
         parser.exit(0)
 
     if options.manifest_only:
@@ -266,3 +243,4 @@ if __name__ == "__main__":
 
     print_manifest_info(manifest, url)
     check_all_streams_and_qualities(url, manifest, int(options.processes))
+    http_client.close()
